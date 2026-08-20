@@ -28,6 +28,11 @@ WORKDIR /root/
 # Copy compiled binary
 COPY --from=builder /app/app .
 
+# Railway 0.5GB RAM optimizations & minimal logging
+ENV GOMEMLIMIT=400MiB
+ENV GOGC=100
+ENV VERBOSE_LOGS=false
+
 # Expose Railway port
 EXPOSE 8080
 

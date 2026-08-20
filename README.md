@@ -84,7 +84,7 @@ A lightweight Go worker optimized for deployment on **Railway** (or any containe
            "fail_count": 0
          },
          {
-           "url": "https://solana-rpc.publicnode.com",
+           "url": "https://api.mainnet-beta.solana.com",
            "is_healthy": true,
            "cooldown_left": "0s",
            "success_count": 2125,

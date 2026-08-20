@@ -179,9 +179,6 @@ type RPCManager struct {
 
 var defaultRPCs = []string{
 	"https://api.mainnet-beta.solana.com",
-	"https://solana-rpc.publicnode.com",
-	"https://solana.lava.build",
-	"https://api.mainnet.solana.com",
 }
 
 func NewRPCManager(heliusKey string, customRPCs []string, cooldown time.Duration) *RPCManager {
@@ -357,14 +354,8 @@ func cleanRPCName(rawURL string) string {
 		return "Helius-RPC"
 	} else if strings.Contains(rawURL, "helius") {
 		return "Helius"
-	} else if strings.Contains(rawURL, "publicnode") {
-		return "PublicNode"
-	} else if strings.Contains(rawURL, "lava") {
-		return "Lava"
 	} else if strings.Contains(rawURL, "mainnet-beta.solana.com") {
 		return "Solana-Mainnet-Beta"
-	} else if strings.Contains(rawURL, "api.mainnet.solana.com") {
-		return "Solana-Mainnet"
 	}
 	return "Custom-RPC"
 }
