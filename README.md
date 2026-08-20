@@ -6,6 +6,7 @@ A lightweight Go worker optimized for deployment on **Railway** (or any containe
 
 ## ⚡ Features
 
+- **High-Throughput Batch Checking**: Queries up to 100 addresses per single RPC request using Solana's `getMultipleAccounts` JSON-RPC method with minimal payload overhead (`dataSlice: { offset: 0, length: 0 }`).
 - **Smart RPC Auto-Rotation**: Distributes queries across a pool of public & custom Solana RPC endpoints.
 - **Circuit-Breaker & Rate-Limit Backoff**:
   - Automatically detects HTTP 429 (Too Many Requests), 5xx errors, timeouts, or RPC rate-limit errors.
@@ -59,6 +60,7 @@ A lightweight Go worker optimized for deployment on **Railway** (or any containe
      - `CUSTOM_RPCS`: *(Optional)* Comma-separated list of custom RPCs (e.g. Helius, Alchemy, QuickNode)
      - `HELIUS_API_KEY`: Your Helius API Key
      - `CONCURRENCY`: `4` (or `2` for low resource usage)
+     - `BATCH_SIZE`: `100` (number of addresses per RPC request, max 100)
      - `DELAY_MS`: `200`
      - `RPC_TIMEOUT_SEC`: `5`
 
@@ -69,9 +71,10 @@ A lightweight Go worker optimized for deployment on **Railway** (or any containe
      {
        "status": "healthy",
        "uptime": "1h24m",
-       "total_checked": 8520,
+       "total_checked": 852000,
        "found": 0,
        "concurrency": 4,
+       "batch_size": 100,
        "rpc_pool": [
          {
            "url": "https://mainnet.helius-rpc.com/?api-key=...",
@@ -102,6 +105,8 @@ A lightweight Go worker optimized for deployment on **Railway** (or any containe
 | `TELEGRAM_CHAT_ID` | *None* | Chat ID where alerts are delivered |
 | `CUSTOM_RPCS` | *None* | Comma-separated list of additional RPC endpoints |
 | `CONCURRENCY` | `4` | Number of parallel worker routines |
+| `BATCH_SIZE` | `100` | Number of addresses queried per RPC request (up to 100) |
 | `DELAY_MS` | `200` | Delay between batches in milliseconds |
 | `RPC_TIMEOUT_SEC` | `5` | Timeout per RPC request in seconds |
+| `VERBOSE_LOGS` | `false` | Enable per-address logging (set `false` on Railway to save bandwidth & CPU) |
 | `PORT` | `8080` | Port for the HTTP health check server |

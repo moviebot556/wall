@@ -31,6 +31,7 @@ type Config struct {
 	TelegramChatID   string
 	HeliusApiKey     string
 	Concurrency      int
+	BatchSize        int
 	DelayMs          int
 	RPCTimeout       time.Duration
 	Port             string
@@ -43,6 +44,12 @@ func loadConfig() Config {
 	if concurrency < 1 {
 		concurrency = 1
 	}
+	batchSize, _ := strconv.Atoi(getEnv("BATCH_SIZE", "100"))
+	if batchSize < 1 {
+		batchSize = 1
+	} else if batchSize > 100 {
+		batchSize = 100 // Solana getMultipleAccounts RPC supports up to 100 pubkeys per request
+	}
 	delayMs, _ := strconv.Atoi(getEnv("DELAY_MS", "200"))
 	if delayMs < 0 {
 		delayMs = 0
@@ -54,7 +61,7 @@ func loadConfig() Config {
 
 	port := getEnv("PORT", "8080")
 	heliusKey := getEnv("HELIUS_API_KEY", "dad6493c-fff4-4280-8a90-857fdf98c1b3")
-	verbose := getEnv("VERBOSE_LOGS", "true") == "true"
+	verbose := getEnv("VERBOSE_LOGS", "false") == "true"
 
 	var customRPCs []string
 	if rawRPCs := os.Getenv("CUSTOM_RPCS"); rawRPCs != "" {
@@ -71,6 +78,7 @@ func loadConfig() Config {
 		TelegramChatID:   os.Getenv("TELEGRAM_CHAT_ID"),
 		HeliusApiKey:     heliusKey,
 		Concurrency:      concurrency,
+		BatchSize:        batchSize,
 		DelayMs:          delayMs,
 		RPCTimeout:       time.Duration(rpcTimeoutSec) * time.Second,
 		Port:             port,
@@ -92,6 +100,31 @@ var (
 	totalChecked uint64
 	foundCount   uint64
 )
+
+// ---------------- Data Structures ----------------
+type WalletItem struct {
+	Mnemonic string
+	Address  string
+}
+
+type AccountInfo struct {
+	Lamports uint64 `json:"lamports"`
+}
+
+type MultipleAccountsResponse struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Result  *struct {
+		Context struct {
+			Slot uint64 `json:"slot"`
+		} `json:"context"`
+		Value []*AccountInfo `json:"value"`
+	} `json:"result"`
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
 
 // ---------------- Telegram ----------------
 func sendTelegramNotification(token, chatID, msg string) {
@@ -320,38 +353,51 @@ func shortAddr(addr string) string {
 }
 
 func cleanRPCName(rawURL string) string {
-	if strings.Contains(rawURL, "helius") {
+	if strings.Contains(rawURL, "mainnet.helius-rpc.com") {
+		return "Helius-RPC"
+	} else if strings.Contains(rawURL, "helius") {
 		return "Helius"
 	} else if strings.Contains(rawURL, "publicnode") {
 		return "PublicNode"
 	} else if strings.Contains(rawURL, "lava") {
 		return "Lava"
-	} else if strings.Contains(rawURL, "mainnet-beta") || strings.Contains(rawURL, "api.mainnet.solana.com") {
-		return "Solana-Public"
+	} else if strings.Contains(rawURL, "mainnet-beta.solana.com") {
+		return "Solana-Mainnet-Beta"
+	} else if strings.Contains(rawURL, "api.mainnet.solana.com") {
+		return "Solana-Mainnet"
 	}
 	return "Custom-RPC"
 }
 
-// ---------------- Resilient Balance Check with Auto-Rotation & Fallback ----------------
-func checkBalanceWithAutoRotation(ctx context.Context, client *http.Client, rpcMgr *RPCManager, addr string, maxRetries int, timeout time.Duration) (float64, string, error) {
+// ---------------- Resilient Batch Balance Check with Auto-Rotation & Fallback ----------------
+func checkMultipleAccountsWithAutoRotation(ctx context.Context, client *http.Client, rpcMgr *RPCManager, addrs []string, maxRetries int, timeout time.Duration) ([]*AccountInfo, string, error) {
 	payload := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1,
-		"method":  "getBalance",
-		"params":  []interface{}{addr},
+		"method":  "getMultipleAccounts",
+		"params": []interface{}{
+			addrs,
+			map[string]interface{}{
+				"encoding": "base64",
+				"dataSlice": map[string]interface{}{
+					"offset": 0,
+					"length": 0,
+				},
+			},
+		},
 	}
 	bodyBytes, _ := json.Marshal(payload)
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return 0, "", ctx.Err()
+			return nil, "", ctx.Err()
 		default:
 		}
 
 		ep := rpcMgr.GetNextHealthyRPC()
 		if ep == nil {
-			return 0, "", fmt.Errorf("no RPC endpoints available")
+			return nil, "", fmt.Errorf("no RPC endpoints available")
 		}
 
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -387,16 +433,7 @@ func checkBalanceWithAutoRotation(ctx context.Context, client *http.Client, rpcM
 			continue
 		}
 
-		var res struct {
-			Result struct {
-				Value int64 `json:"value"`
-			} `json:"result"`
-			Error *struct {
-				Code    int    `json:"code"`
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-
+		var res MultipleAccountsResponse
 		if err := json.Unmarshal(body, &res); err != nil {
 			rpcMgr.MarkRateLimited(ep.URL, "invalid JSON response")
 			continue
@@ -407,11 +444,16 @@ func checkBalanceWithAutoRotation(ctx context.Context, client *http.Client, rpcM
 			continue
 		}
 
+		if res.Result == nil || len(res.Result.Value) != len(addrs) {
+			rpcMgr.MarkRateLimited(ep.URL, "mismatched accounts length in RPC response")
+			continue
+		}
+
 		rpcMgr.MarkSuccess(ep.URL)
-		return float64(res.Result.Value) / 1e9, ep.URL, nil
+		return res.Result.Value, ep.URL, nil
 	}
 
-	return 0, "", fmt.Errorf("all RPC attempts exhausted")
+	return nil, "", fmt.Errorf("all RPC attempts exhausted")
 }
 
 // ---------------- Main ----------------
@@ -434,6 +476,7 @@ func main() {
 			"total_checked": atomic.LoadUint64(&totalChecked),
 			"found":         atomic.LoadUint64(&foundCount),
 			"concurrency":   cfg.Concurrency,
+			"batch_size":    cfg.BatchSize,
 			"rpc_pool":      rpcMgr.Status(),
 		}
 		json.NewEncoder(w).Encode(status)
@@ -489,8 +532,8 @@ func main() {
 		log.Println("[⚠️ Telegram Alerts] Inactive (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set in environment)")
 	}
 
-	log.Printf("Worker loop started with %d RPC endpoints (Concurrency: %d, Delay: %dms)\n",
-		len(rpcMgr.endpoints), cfg.Concurrency, cfg.DelayMs)
+	log.Printf("Worker loop started with %d RPC endpoints (Concurrency: %d, BatchSize: %d, Delay: %dms)\n",
+		len(rpcMgr.endpoints), cfg.Concurrency, cfg.BatchSize, cfg.DelayMs)
 
 	// 4. Worker loop
 	for {
@@ -506,51 +549,75 @@ func main() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				mnemonic, err := generateMnemonic()
+
+				wallets := make([]WalletItem, 0, cfg.BatchSize)
+				addrs := make([]string, 0, cfg.BatchSize)
+				for j := 0; j < cfg.BatchSize; j++ {
+					mnemonic, err := generateMnemonic()
+					if err != nil {
+						continue
+					}
+					addr, err := deriveSolanaAddress(mnemonic, "")
+					if err != nil {
+						continue
+					}
+					wallets = append(wallets, WalletItem{Mnemonic: mnemonic, Address: addr})
+					addrs = append(addrs, addr)
+				}
+
+				if len(addrs) == 0 {
+					return
+				}
+
+				accounts, _, err := checkMultipleAccountsWithAutoRotation(ctx, client, rpcMgr, addrs, 3, cfg.RPCTimeout)
 				if err != nil {
 					return
 				}
-				addr, err := deriveSolanaAddress(mnemonic, "")
-				if err != nil {
-					return
-				}
 
-				bal, usedRPC, err := checkBalanceWithAutoRotation(ctx, client, rpcMgr, addr, 3, cfg.RPCTimeout)
-				if err != nil {
-					return
-				}
+				batchSize := uint64(len(addrs))
+				endCount := atomic.AddUint64(&totalChecked, batchSize)
+				startCount := endCount - batchSize
 
-				count := atomic.AddUint64(&totalChecked, 1)
+				var nonZeroInBatch int
+				for idx, acc := range accounts {
+					bal := 0.0
+					if acc != nil && acc.Lamports > 0 {
+						bal = float64(acc.Lamports) / 1e9
+					}
+					w := wallets[idx]
+					itemNum := startCount + uint64(idx) + 1
 
-				// Real-time log in console
-				if cfg.VerboseLogs {
-					log.Printf("[#%d] %s | %.9f SOL | %s\n", count, shortAddr(addr), bal, cleanRPCName(usedRPC))
-				}
-
-				if bal > 0 {
-					atomic.AddUint64(&foundCount, 1)
-
-					// Rich HTML formatted message for Telegram
-					telegramMsg := fmt.Sprintf(
-						"🎉 <b>SOLANA WALLET FOUND!</b>\n\n"+
-							"💰 <b>Balance:</b> <code>%.9f SOL</code>\n"+
-							"📍 <b>Address:</b> <code>%s</code>\n\n"+
-							"🔑 <b>Mnemonic:</b>\n<code>%s</code>\n\n"+
-							"⏰ <b>Timestamp:</b> %s",
-						bal, addr, mnemonic, time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
-					)
-
-					log.Printf("🎉 [BALANCE FOUND] Address: %s | Balance: %.9f SOL\n", addr, bal)
-
-					f, err := os.OpenFile("nonzero.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-					if err == nil {
-						rawLog := fmt.Sprintf("Mnemonic: %s\nAddress: %s\nBalance: %.9f SOL\nTime: %s\n\n",
-							mnemonic, addr, bal, time.Now().UTC().Format(time.RFC3339))
-						_, _ = f.WriteString(rawLog)
-						f.Close()
+					// Real-time log in console: count, address, balance, and mnemonic
+					if cfg.VerboseLogs {
+						log.Printf("[#%d] %s | %.9f SOL | %s\n", itemNum, w.Address, bal, w.Mnemonic)
 					}
 
-					sendTelegramNotification(cfg.TelegramBotToken, cfg.TelegramChatID, telegramMsg)
+					if bal > 0 {
+						nonZeroInBatch++
+						atomic.AddUint64(&foundCount, 1)
+
+						// Rich HTML formatted message for Telegram
+						telegramMsg := fmt.Sprintf(
+							"🎉 <b>SOLANA WALLET FOUND!</b>\n\n"+
+								"💰 <b>Balance:</b> <code>%.9f SOL</code>\n"+
+								"📍 <b>Address:</b> <code>%s</code>\n\n"+
+								"🔑 <b>Mnemonic:</b>\n<code>%s</code>\n\n"+
+								"⏰ <b>Timestamp:</b> %s",
+							bal, w.Address, w.Mnemonic, time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
+						)
+
+						log.Printf("🎉 [BALANCE FOUND] Address: %s | Balance: %.9f SOL | Mnemonic: %s\n", w.Address, bal, w.Mnemonic)
+
+						f, err := os.OpenFile("nonzero.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+						if err == nil {
+							rawLog := fmt.Sprintf("Mnemonic: %s\nAddress: %s\nBalance: %.9f SOL\nTime: %s\n\n",
+								w.Mnemonic, w.Address, bal, time.Now().UTC().Format(time.RFC3339))
+							_, _ = f.WriteString(rawLog)
+							f.Close()
+						}
+
+						sendTelegramNotification(cfg.TelegramBotToken, cfg.TelegramChatID, telegramMsg)
+					}
 				}
 			}()
 		}
