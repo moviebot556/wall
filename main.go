@@ -35,6 +35,7 @@ type Config struct {
 	RPCTimeout       time.Duration
 	Port             string
 	CustomRPCs       []string
+	VerboseLogs      bool
 }
 
 func loadConfig() Config {
@@ -53,6 +54,7 @@ func loadConfig() Config {
 
 	port := getEnv("PORT", "8080")
 	heliusKey := getEnv("HELIUS_API_KEY", "dad6493c-fff4-4280-8a90-857fdf98c1b3")
+	verbose := getEnv("VERBOSE_LOGS", "true") == "true"
 
 	var customRPCs []string
 	if rawRPCs := os.Getenv("CUSTOM_RPCS"); rawRPCs != "" {
@@ -73,6 +75,7 @@ func loadConfig() Config {
 		RPCTimeout:       time.Duration(rpcTimeoutSec) * time.Second,
 		Port:             port,
 		CustomRPCs:       customRPCs,
+		VerboseLogs:      verbose,
 	}
 }
 
@@ -165,8 +168,6 @@ func NewRPCManager(heliusKey string, customRPCs []string, cooldown time.Duration
 	}
 }
 
-// GetNextHealthyRPC selects the next available healthy RPC via round-robin.
-// If all endpoints are cooling down, it returns the endpoint with the shortest remaining cooldown.
 func (m *RPCManager) GetNextHealthyRPC() *RPCEndpoint {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -217,7 +218,6 @@ func (m *RPCManager) MarkRateLimited(url string, reason string) {
 	for _, ep := range m.endpoints {
 		if ep.URL == url {
 			ep.FailCount++
-			// Exponential backoff: 30s, 60s, 120s... max 5 mins
 			backoffMultiplier := 1 << (ep.FailCount - 1)
 			if backoffMultiplier > 10 {
 				backoffMultiplier = 10
@@ -225,7 +225,7 @@ func (m *RPCManager) MarkRateLimited(url string, reason string) {
 			duration := m.cooldown * time.Duration(backoffMultiplier)
 			ep.CooldownUntil = time.Now().Add(duration)
 			ep.LastError = reason
-			log.Printf("[RPC Auto-Rotation] Endpoint rate-limited/failed: %s (cooldown for %v). Reason: %s\n", url, duration, reason)
+			log.Printf("[⚠️ RPC Rate-Limited] %s (cooldown %v). Reason: %s\n", cleanRPCName(url), duration, reason)
 			break
 		}
 	}
@@ -299,8 +299,29 @@ func generateMnemonic() (string, error) {
 	return bip39.NewMnemonic(entropy)
 }
 
+// ---------------- Helpers ----------------
+func shortAddr(addr string) string {
+	if len(addr) > 12 {
+		return addr[:4] + "..." + addr[len(addr)-4:]
+	}
+	return addr
+}
+
+func cleanRPCName(rawURL string) string {
+	if strings.Contains(rawURL, "helius") {
+		return "Helius"
+	} else if strings.Contains(rawURL, "publicnode") {
+		return "PublicNode"
+	} else if strings.Contains(rawURL, "lava") {
+		return "Lava"
+	} else if strings.Contains(rawURL, "mainnet-beta") || strings.Contains(rawURL, "api.mainnet.solana.com") {
+		return "Solana-Public"
+	}
+	return "Custom-RPC"
+}
+
 // ---------------- Resilient Balance Check with Auto-Rotation & Fallback ----------------
-func checkBalanceWithAutoRotation(ctx context.Context, client *http.Client, rpcMgr *RPCManager, addr string, maxRetries int, timeout time.Duration) (float64, error) {
+func checkBalanceWithAutoRotation(ctx context.Context, client *http.Client, rpcMgr *RPCManager, addr string, maxRetries int, timeout time.Duration) (float64, string, error) {
 	payload := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -312,13 +333,13 @@ func checkBalanceWithAutoRotation(ctx context.Context, client *http.Client, rpcM
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return 0, "", ctx.Err()
 		default:
 		}
 
 		ep := rpcMgr.GetNextHealthyRPC()
 		if ep == nil {
-			return 0, fmt.Errorf("no RPC endpoints available")
+			return 0, "", fmt.Errorf("no RPC endpoints available")
 		}
 
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -338,7 +359,6 @@ func checkBalanceWithAutoRotation(ctx context.Context, client *http.Client, rpcM
 			continue
 		}
 
-		// Handle HTTP Rate Limit or Server Errors
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode >= 500 {
 			resp.Body.Close()
 			cancel()
@@ -371,17 +391,15 @@ func checkBalanceWithAutoRotation(ctx context.Context, client *http.Client, rpcM
 		}
 
 		if res.Error != nil {
-			// RPC rate-limit error code (-32005 or similar)
 			rpcMgr.MarkRateLimited(ep.URL, fmt.Sprintf("rpc error [%d]: %s", res.Error.Code, res.Error.Message))
 			continue
 		}
 
-		// Success!
 		rpcMgr.MarkSuccess(ep.URL)
-		return float64(res.Result.Value) / 1e9, nil
+		return float64(res.Result.Value) / 1e9, ep.URL, nil
 	}
 
-	return 0, fmt.Errorf("all RPC attempts exhausted")
+	return 0, "", fmt.Errorf("all RPC attempts exhausted")
 }
 
 // ---------------- Main ----------------
@@ -389,19 +407,18 @@ func main() {
 	cfg := loadConfig()
 	client := &http.Client{}
 
-	// Initialize RPC Manager with 30-second initial cooldown
 	rpcMgr := NewRPCManager(cfg.HeliusApiKey, cfg.CustomRPCs, 30*time.Second)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 1. Health check & status server (Required by Railway / Render / Fly.io)
+	// 1. Health check & status server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		status := map[string]interface{}{
 			"status":        "healthy",
-			"uptime":        time.Since(startTime).String(),
+			"uptime":        time.Since(startTime).Truncate(time.Second).String(),
 			"total_checked": atomic.LoadUint64(&totalChecked),
 			"found":         atomic.LoadUint64(&foundCount),
 			"concurrency":   cfg.Concurrency,
@@ -422,7 +439,7 @@ func main() {
 		}
 	}()
 
-	// 2. Handle graceful termination
+	// 2. Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -434,10 +451,30 @@ func main() {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
+	// 3. Periodic Heartbeat Logger (every 10 seconds)
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		var lastChecked uint64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				current := atomic.LoadUint64(&totalChecked)
+				diff := current - lastChecked
+				speed := float64(diff) / 10.0
+				lastChecked = current
+				log.Printf("[📊 Live Stats] Total: %d | Speed: %.1f checks/sec | Found: %d | Uptime: %s\n",
+					current, speed, atomic.LoadUint64(&foundCount), time.Since(startTime).Truncate(time.Second))
+			}
+		}
+	}()
+
 	log.Printf("Worker loop started with %d RPC endpoints (Concurrency: %d, Delay: %dms)\n",
 		len(rpcMgr.endpoints), cfg.Concurrency, cfg.DelayMs)
 
-	// 3. Worker loop
+	// 4. Worker loop
 	for {
 		select {
 		case <-ctx.Done():
@@ -460,27 +497,29 @@ func main() {
 					return
 				}
 
-				// Check balance with auto-rotation across RPCs and up to 3 retries
-				bal, err := checkBalanceWithAutoRotation(ctx, client, rpcMgr, addr, 3, cfg.RPCTimeout)
+				bal, usedRPC, err := checkBalanceWithAutoRotation(ctx, client, rpcMgr, addr, 3, cfg.RPCTimeout)
 				if err != nil {
 					return
 				}
 
-				atomic.AddUint64(&totalChecked, 1)
+				count := atomic.AddUint64(&totalChecked, 1)
+
+				// Real-time log in console
+				if cfg.VerboseLogs {
+					log.Printf("[#%d] %s | %.9f SOL | %s\n", count, shortAddr(addr), bal, cleanRPCName(usedRPC))
+				}
 
 				if bal > 0 {
 					atomic.AddUint64(&foundCount, 1)
 					msg := fmt.Sprintf("🎉 Balance Found!\nAddress: %s\nBalance: %.9f SOL\nMnemonic: %s", addr, bal, mnemonic)
 					log.Println(msg)
 
-					// Log to local file
 					f, err := os.OpenFile("nonzero.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 					if err == nil {
 						_, _ = f.WriteString(msg + "\n\n")
 						f.Close()
 					}
 
-					// Send Telegram alert
 					sendTelegramNotification(cfg.TelegramBotToken, cfg.TelegramChatID, msg)
 				}
 			}()
